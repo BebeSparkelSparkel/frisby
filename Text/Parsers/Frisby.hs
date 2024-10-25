@@ -1,5 +1,6 @@
 {-# LANGUAGE MagicHash, RecursiveDo, RankNTypes, EmptyDataDecls, GADTs,
-             GeneralizedNewtypeDeriving, PatternGuards #-}
+             GeneralizedNewtypeDeriving, PatternGuards, TypeFamilies,
+             FlexibleContexts, ConstraintKinds, LambdaCase, ScopedTypeVariables, RecordWildCards, PatternSynonyms #-}
 -- for the exported rank-2 type of runPeg,
 -- as well as the implementation using GADTs, generalised newtype deriving,
 -- also a phantom datatype used with unsafeCoerce
@@ -122,9 +123,13 @@ module Text.Parsers.Frisby(
     eof,
     getPos,
     char,
-    noneOf,
+    elem,
     oneOf,
+    elemOf,
+    noneOf,
+    noneElemOf,
     text,
+    chunk,
     unit,
     rest,
     discard,
@@ -178,10 +183,7 @@ import Control.Applicative
    hiding(many,optional) --though same meaning 'many', and superior 'optional'
 import qualified Control.Applicative (many)
 import qualified Data.IntSet as IntSet
-import Control.Monad.Fix
-import Control.Monad.Fail
-import Control.Monad.Identity
-import Data.Char(ord,chr)
+import Control.Monad.Fix (MonadFix)
 import Control.Monad.State
 import Data.Array hiding((//))
 import Data.Semigroup (Semigroup)
@@ -190,7 +192,11 @@ import Data.Monoid hiding(Any,(<>))
 import qualified Data.Map as Map
 import qualified Control.Monad.Fail as Fail
 import Unsafe.Coerce (unsafeCoerce)
-import Prelude hiding((<>))
+import Prelude hiding((<>), elem)
+import Data.Sequences (IsSequence(fromList,uncons), stripPrefix)
+import Data.MonoTraversable (Element, MonoPointed(opoint), MonoFoldable(otoList,onull,olength), oconcat)
+import Text.Printf (IsChar(fromChar))
+import Data.Functor (void)
 
 -- Essentially we are manipulating a polytypic cyclic graph (the P structure).
 -- This is difficult to do in Haskell.
@@ -253,75 +259,81 @@ type PMImp a = State Token a
 
 
 -- 's' added for safe state, just as the ST monad's interface uses
-newtype P s a = P { fromP :: PE a }
+newtype P s mono a = P {evalP :: PE mono a}
     deriving(Functor,Applicative,Alternative,Semigroup,Monoid)
 
-data PE a where
-    Char :: IntSet.IntSet -> PE Char
-    Any  ::  PE Char
-    Failure :: PE a
-    Named :: Token -> PE a -> PE a
-    Not :: PE a -> PE ()
-    PMap :: (a -> b) -> PE a -> PE b
-    Slash :: PE a -> PE a -> PE a
-    ThenCat :: PE [a] -> PE [a] -> PE [a]
-    Star :: PE a -> PE [a]
-    StarUntil :: PE a -> PE b -> PE [a]
-    StarMax :: Int -> PE a -> PE [a]
+data PE mono a where
+    Char :: IsSequence mono => IntSet.IntSet -> PE mono (Element mono)
+    Any :: PE mono (Element mono)
+    Chunk :: IsSequence mono => mono -> PE mono mono
+    Failure :: PE mono a
+    Named :: Token -> PE mono a -> PE mono a
+    Not :: PE mono a -> PE mono ()
+    PMap :: (a -> b) -> PE mono a -> PE mono b
+    Slash :: PE mono a -> PE mono a -> PE mono a
+    ThenCat :: Semigroup m => PE mono m -> PE mono m -> PE mono m
+    Star :: PE mono a -> PE mono [a]
+    --StarUntil :: PE mono a -> PE mono b -> PE mono [a]
+    --StarMax :: Int -> PE mono a -> PE mono [a]
 
-    Then :: PE a -> PE b -> PE (a,b)
-    GetPos :: PE Int
-    Unit :: a -> PE a
-    When :: PE a -> (a -> Bool) -> PE a
-    Rest :: PE [Char]
-    Peek :: PE a -> PE a
+    Then :: PE mono a -> PE mono b -> PE mono (a,b)
+    GetPos :: PE mono Int
+    Unit :: a -> PE mono a
+    When :: PE mono a -> (a -> Bool) -> PE mono a
+    Rest :: PE mono mono
+    Peek :: PE mono a -> PE mono a
 
-
-
-instance Functor PE where
+instance Functor (PE mono) where
     fmap = PMap
 
-instance Applicative PE where
+instance Applicative (PE mono) where
 --should another constructor be added, rather?
 --perhaps Then and ThenCat combined and parameterized by
 --the function (++), (,) ... but, 'text', etc, does this too
     mf <*> ma = PMap (\(f,a) -> f a) (Then mf ma)
     pure = Unit
 
-instance Alternative PE where
+instance Alternative (PE mono) where
     (<|>) = Slash
     empty = Failure
     some p = uncurry (:) <$> Then p (Star p)
     many  = Star
 
-instance Semigroup (PE a) where
+instance Semigroup (PE mono a) where
     (<>) = Slash
 
-instance Monoid (PE a) where
+instance Monoid (PE mono a) where
     mappend = (Semigroup.<>)
     mempty = Failure
 
 
 -- | Return a value, always succeeds
-unit :: a ->  P s a
+unit :: a ->  P s mono a
 unit a = P $ Unit a
 
 -- | Match a specified character
-char :: Char -> P s Char
-char c = P $ Char (IntSet.singleton (ord c))
+char :: (IsChar (Element mono), IsSequence mono, Enum (Element mono)) => Char -> P s mono ()
+char = elem . fromChar
+
+-- | Match a specified element
+elem :: (IsSequence mono, Enum (Element mono)) => Element mono -> P s mono ()
+elem = void . P . Char . IntSet.singleton . fromEnum
 
 -- | Match some text
-text :: String -> P s String
-text (x:xs) = fmap ( \ (c,cs) -> c:cs) $ char x <> text xs
-text [] = unit []
+text :: (IsSequence mono, IsChar (Element mono)) => String -> P s mono ()
+text = chunk . fromList . map fromChar
+
+chunk :: IsSequence mono => mono -> P s mono ()
+chunk s | onull s = unit ()
+        | otherwise = void $ P $ Chunk s
 
 -- | Immediately consume and return the rest of the input
 -- equivalent to (many anyChar), but more efficient.
-rest :: P s String
+rest :: P s mono mono
 rest = P Rest
 
 -- | Match any character, fails on EOF
-anyChar :: P s Char
+anyChar :: P s mono (Element mono)
 anyChar = P Any
 
 infixl 1 //, //>
@@ -330,134 +342,141 @@ infixl 3 <>, <++>
 infixl 4 ->>, <<-
 
 -- | Match first argument, then match the second, returning both in a tuple
-(<>) :: P s a -> P s b -> P s (a,b)
+(<>) :: P s mono a -> P s mono b -> P s mono (a,b)
 P x <> P y = P $ x `Then` y
 
 -- | Match a pair of lists and concatenate them
-(<++>) :: P s [a] -> P s [a] -> P s [a]
+(<++>) :: Semigroup m => P s mono m -> P s mono m -> P s mono m
 P x <++> P y = P $ x `ThenCat` y
 
 -- | Match first argument, then match the second, returning only the value on the left.
 --
 -- > x <<- y = x <> y ## fst
 --
-(<<-) :: P s a -> P s b -> P s a
+(<<-) :: P s mono a -> P s mono b -> P s mono a
 x <<- y = x <> y ## fst
 
 -- | Match first argument, then match the second, returning only the value on the right.
 --
 -- > x ->> y = x <> y ## snd
-(->>) :: P s a -> P s b -> P s b
+(->>) :: P s mono a -> P s mono b -> P s mono b
 x ->> y = x <> y ## snd
 
 -- | Ordered choice, try left argument, if it fails try the right one.
 -- This does not introduce any backtracking or penalty.
-(//) :: P s a -> P s a -> P s a
+(//) :: P s mono a -> P s mono a -> P s mono a
 P x // P y = P $ x `Slash` y
 
 -- | Ordered choice, try left argument, if it fails then return right argument.
-(//>) :: P s a -> a -> P s a
+(//>) :: P s mono a -> a -> P s mono a
 x //> y = x // unit y
 
 -- | Map a parser through a function. a fancy version of 'fmap'.
-(##) :: P s a -> (a -> b) -> P s b
+(##) :: P s mono a -> (a -> b) -> P s mono b
 x ## y = fmap y x
 
 -- | Parse left argument and return the right argument.
-(##>) :: P s a -> b -> P s b
+(##>) :: P s mono a -> b -> P s mono b
 x ##> y = discard x ->> unit y
 
 
 -- | Succeeds when the argument does not.
-doesNotMatch :: P s a -> P s ()
+doesNotMatch :: P s mono a -> P s mono ()
 doesNotMatch (P x) = P $ Not x
 
 -- | Succeeds when the argument does, but consumes no input.
 -- Equivalant to \p -> discard (peek p)
-matches :: P s a -> P s ()
+matches :: P s mono a -> P s mono ()
 matches =  peek . discard
 
 -- | Parse something and return it,  but do not advance the input stream.
-peek :: P s a -> P s a
+peek :: P s mono a -> P s mono a
 peek (P p) = P $ Peek p
 
 -- | Succeed only if thing parsed passes a predicate.
-onlyIf :: P s a -> (a -> Bool) -> P s a
+onlyIf :: P s mono a -> (a -> Bool) -> P s mono a
 onlyIf (P x) y = P $ When x y
 
 -- | Parse many of something. Behaves like * in regexes.
 -- This eats as much as it possibly can, if you want a minimal much rule, then use 'manyUntil' which stops when a.
 --
 
-many :: P s a -> P s [a]
+many :: P s mono a -> P s mono [a]
 many (P p) = P $ Star p
 
 -- | Parse many of something via the minimal munch rule. behaves like *? in
 -- perl regexes. The final item is not consumed.
 
-manyUntil :: P s b -> P s a -> PM s (P s [a])
+manyUntil :: P s mono b -> P s mono a -> PM s (P s mono [a])
 manyUntil final p =
   do rec rule <- newRule $ matches final ##> []
                  // p <> rule ## uncurry (:)
      return rule
 
 -- | First matching parse wins, a simple iteration of (\/\/).
-choice :: [P s a] -> P s a
+choice :: [P s mono a] -> P s mono a
 choice = mconcat
 
 -- | Get current position in file as number of characters since the beginning.
-getPos :: P s Int
+getPos :: P s mono Int
 getPos = P GetPos
 
 -- | Equivalent to
 --
 -- > between open close thing = open ->> thing <<- close
-between :: P s a -> P s b -> P s c -> P s c
+between :: P s mono a -> P s mono b -> P s mono c -> P s mono c
 between open close thing = open ->> thing <<- close
 
 -- | Parse something if you can, else return first value
 --
 -- > option a p = p // unit a
-option :: a -> P s a -> P s a
+option :: a -> P s mono a -> P s mono a
 option a p = p // unit a
 
 -- | Parse something if you can, discarding it.
 --
 -- > option a p = discard p // unit ()
-optional :: P s a -> P s ()
+optional :: P s mono a -> P s mono ()
 optional p = discard p // unit ()
 
 -- | Throw away the result of something.
 --
 -- > discard p = p ->> unit ()
-discard :: P s a -> P s ()
+discard :: P s mono a -> P s mono ()
 discard p = p ->> unit ()
 
 -- | am at the end of string.
-eof :: P s ()
+eof :: P s mono ()
 eof = doesNotMatch anyChar
 
 -- | am at the beginning of the string.
-bof :: P s ()
+bof :: P s mono ()
 bof = discard (getPos `onlyIf` (== 0))
 
 
 -- | Match one or more of something via maximal munch rule.
-many1 :: P s a -> P s [a]
+many1 :: P s mono a -> P s mono [a]
 many1 x  = (\ (c,cs) -> c:cs)  `fmap` (x <> many x)
 
 -- | Match one of the set of characters.
-oneOf :: [Char] -> P s Char
-oneOf [] = parseFailure
-oneOf xs = P $ Char (IntSet.fromList $ map ord xs) -- foldl (//) parseFailure (map char xs)
+oneOf :: (IsChar (Element mono), IsSequence mono, Enum (Element mono)) => [Char] -> P s mono (Element mono)
+oneOf cs = elemOf (map fromChar cs)
+
+-- | Match one of the set of elements.
+elemOf :: (IsSequence mono, Enum (Element mono)) => [Element mono] -> P s mono (Element mono)
+elemOf es = P $ Char (IntSet.fromList (map fromEnum es))
 
 -- | Match any character other than the ones in the list.
-noneOf :: [Char] -> P s Char
-noneOf [] = anyChar
-noneOf xs = doesNotMatch (oneOf xs) ->> anyChar  -- foldl (//) parseFailure (map char xs)
+noneOf :: (IsChar (Element mono), IsSequence mono, Enum (Element mono)) => [Char] -> P s mono (Element mono)
+noneOf cs = noneElemOf (map fromChar cs)
+
+-- | Match any element other than the ones in the list.
+noneElemOf :: (IsSequence mono, Enum (Element mono)) => [Element mono] -> P s mono (Element mono)
+noneElemOf [] = anyChar
+noneElemOf es = doesNotMatch (elemOf es) ->> anyChar
 
 -- | Fails, is identity of (\/\/) and unit of (\<\>).
-parseFailure :: P s a
+parseFailure :: P s mono a
 parseFailure = P Failure
 
 
@@ -468,18 +487,18 @@ data Unknown
 
 type DerivMapTo a = Array Token a
 
-type NM a = State (Token,Map.Map Token Token,[(Token,PE Unknown)]) a
+type NM mono a = State (Token,Map.Map Token Token,[(Token,PE mono Unknown)]) a
 
-normalizePElem :: PE a -> (PE a, DerivMapTo (PE Unknown))
+normalizePElem :: PE mono a -> (PE mono a, DerivMapTo (PE mono Unknown))
 normalizePElem pe = (rootNormPE, normPEs)
   where
     (rootNormPE, state) = runState (normalizePElemNM pe) (0,mempty,mempty)
     normPEs = array (0, nTokens - 1) assocNormPEs
                 where (nTokens, _, assocNormPEs) = state
 
-normalizePElemNM :: PE a -> NM (PE a)
+normalizePElemNM :: PE mono a -> NM mono (PE mono a)
 normalizePElemNM pe = f pe where
-    f :: forall a . PE a -> NM (PE a)
+    f :: PE mono a -> NM mono (PE mono a)
     f (Then x y) = do
         x <- f x
         y <- f y
@@ -494,7 +513,7 @@ normalizePElemNM pe = f pe where
         case (x,y) of
             (Failure,_) -> return Failure
             (_,Failure) -> return Failure
-            (Unit a,Unit b) -> return (Unit (a ++ b))
+            (Unit a,Unit b) -> return (Unit (a Semigroup.<> b))
             (x,y) -> return (ThenCat x y)
     f (Slash x y) = do
         x <- f x
@@ -503,6 +522,8 @@ normalizePElemNM pe = f pe where
 
     f (Char x) | IntSet.null x = return Failure
     f c@Char {} = return c
+    f (Chunk x) | onull x = return (Unit mempty)
+                | otherwise = return (Chunk x)
     f p@Failure = return p
     f p@Unit {} = return p
     f p@Any = return p
@@ -533,9 +554,9 @@ normalizePElemNM pe = f pe where
                 put (i + 1,Map.insert n i m,cm)
                 p' <- f p
                 (ni,m,cm) <- get
-                put (ni,m,(i,unsafeCoerce p' :: PE Unknown):cm)
+                put (ni,m,(i,unsafeCoerce p' :: PE mono Unknown):cm)
                 return (Named i (error "no need"))
-    slash :: forall a . PE a -> PE a -> PE a
+    slash :: forall a mono. PE mono a -> PE mono a -> PE mono a
     slash a Failure  = a
     slash Failure b  = b
     slash (Unit a) _ = (Unit a)
@@ -546,7 +567,7 @@ normalizePElemNM pe = f pe where
     slash x y = Slash x y
     -- It's okay, just suboptimal, to return True when input can't be consumed;
     -- it's incorrect to return False when it might in fact consume input.
-    mayConsumeInput :: PE a -> Bool
+    mayConsumeInput :: PE mono a -> Bool
     mayConsumeInput Failure = False
     mayConsumeInput Unit {} = False
     mayConsumeInput (Then x y) = mayConsumeInput x || mayConsumeInput y
@@ -560,18 +581,18 @@ normalizePElemNM pe = f pe where
 -- being put into a Derivs, which is fine (in fact, important,
 -- so that an unevaluated chain of thunks from the past doesn't
 -- build up when the character index isn't needed for a while)
-data Derivs = Derivs {
-    derivChar :: (Results Char),
+data Derivs mono = Derivs {
+    derivElem :: Results mono (Element mono),
     derivIndex :: Int,
-    derivArray :: DerivMapTo (Results Unknown),
-    derivRest :: String
-    }
+    derivArray :: DerivMapTo (Results mono Unknown),
+    derivRest :: mono
+}
 
-data Results a = Parsed a Derivs | NoParse
+data Results mono a = Parsed a (Derivs mono) | NoParse
 
 --this instance really should be derived
 --(once deriving Functor is available) :
-instance Functor Results where
+instance Functor (Results mono) where
     fmap f (Parsed a arr) = Parsed (f a) arr
     fmap _ NoParse = NoParse
 
@@ -592,7 +613,7 @@ instance Functor Results where
 --
 --
 
-runPeg :: (forall s . PM s (P s a)) -> String -> a
+runPeg :: forall mono a. (IsSequence mono, Enum (Element mono), Eq (Element mono)) => (forall s . PM s (P s mono a)) -> mono -> a
 runPeg peg =
    --there is a nontrivial amount of work that only depends
    --on peg, so let's suggest that to be shared by using an
@@ -602,8 +623,9 @@ runPeg peg =
     pout input = case rootParser (f 0 input) of
         Parsed a _ -> a
         NoParse -> error "runPeg: no parse"
-    emptyDAt n = emptyD { derivIndex = n }
-      where emptyD = f 0 [] --is the sharing here (particularly the array)
+    emptyDAt :: Int -> Derivs mono
+    emptyDAt n = (f 0 mempty) { derivIndex = n }
+      --where emptyD = f 0 mempty --is the sharing here (particularly the array)
               -- worth much? (does it necessarily even exist if we stuff
               -- it into a where clause like this?)
     --Optimize the parser once initially
@@ -623,15 +645,17 @@ runPeg peg =
     --rootPElemBeforeNormalization actually contains all parsers it references,
     --recursively, just labelled by PM so the infinite recursion can be
     --detected and stopped.
-    rootPElemBeforeNormalization = fromP $ evalState (case peg of PM x -> x) 1
+    rootPElemBeforeNormalization = evalP $ evalState (case peg of PM x -> x) 1
     --rootPElemAfterNormalization need not be among the array if it is just
     --the parser used to get started at the beginning of input, such as:
     --       mdo p <- newRule $ ...; return (p <> rest)
     (rootPElemAfterNormalization, arrayNormalizedPElems)
                       = normalizePElem rootPElemBeforeNormalization
     --arrayParsers, rootParser are out here for increased sharing of g's work
+    arrayParsers :: Array Token (Derivs mono -> Results mono Unknown)
     arrayParsers = fmap g arrayNormalizedPElems
     rootParser = g rootPElemAfterNormalization
+    f :: Int -> mono -> Derivs mono
     f n s = n' `seq` d where
         --At each position in the file, we memoize (lazily) the results of all
         --our finite number of parsers.  Since lookahead is similarly
@@ -641,24 +665,30 @@ runPeg peg =
         --chr is the secret recursion over the input characters that
         --grabs all of their positions and generates the lazy shared
         --sequence of arrays.
-        chr = case s of (x:xs) -> Parsed x (f n' xs) ; [] -> NoParse
+        chr = case uncons s of
+                Just (x,xs) -> Parsed x (f n' xs)
+                Nothing -> NoParse
         n' = n + 1
     --the lets are explicitly floated outside the deriv-lambdas so that
     --their results will be shared given the partial application in defs
     --(essentially this avoids repeating the process of turning the PE tree
     --into functions, nothing huge)
-    g :: PE a -> Derivs -> Results a
-    g (Named n _) = \ (Derivs _ _ d _) -> unsafeCoerce (d ! n)
-    g Any = \ (Derivs p _ _ _) -> p
-    g (Char cs) = \ (Derivs p _ _ _) -> case p of
-        Parsed c d | ord c `IntSet.member` cs -> Parsed c d
+    g :: forall a. PE mono a -> Derivs mono -> Results mono a
+    g (Named n _) = \(Derivs _ _ d _) -> unsafeCoerce (d ! n)
+    g Any = \(Derivs p _ _ _) -> p
+    g (Char cs) = \(Derivs p _ _ _) -> case p of
+        Parsed c d | fromEnum c `IntSet.member` cs -> Parsed c d
         _ -> NoParse
+    g (Chunk expected) = \(Derivs _ n _ input) ->
+        case stripPrefix expected input of
+            Nothing -> NoParse
+            Just rest -> Parsed expected (f (n + olength expected) rest)
     g GetPos = \d -> Parsed (derivIndex d) d
     g Failure = \_ -> NoParse
     g (Not p) = let m = g p in \d -> case m d of
         Parsed {} -> NoParse
-        NoParse {} -> Parsed () d
-    g (PMap fn p) = let p' = g p in \ d -> fmap fn (p' d)
+        NoParse -> Parsed () d
+    g (PMap fn p) = let p' = g p in \d -> fmap fn (p' d)
     g (Slash x y) = let x' = g x; y' = g y in \d -> case x' d of
         p@Parsed {} -> p
         NoParse -> y' d
@@ -670,9 +700,9 @@ runPeg peg =
     g (ThenCat x y) = let x' = g x; y' = g y in \d -> case x' d of
         NoParse -> NoParse
         Parsed a d' -> case y' d' of
-            Parsed b d'' -> Parsed (a ++ b) d''
+            Parsed b d'' -> Parsed (a Semigroup.<> b) d''
             NoParse -> NoParse
-    g Rest = \d -> Parsed (derivRest d) (emptyDAt (derivIndex d + length (derivRest d)))
+    g Rest = \d -> Parsed (derivRest d) (emptyDAt (derivIndex d + olength (derivRest d)))
     g (Unit x) = \d -> Parsed x d
     g (Peek p) = let p' = g p in \d -> case p' d of
         Parsed r _ -> Parsed r d
@@ -704,7 +734,7 @@ runPeg peg =
 -- All recursive calls must be bound via a rule. Left recursion should be avoided.
 --
 
-newRule :: P s a -> PM s (P s a)
+newRule :: P s mono a -> PM s (P s mono a)
 newRule pe@(P Any {}) = return pe
 newRule pe@(P Char {}) = return pe
 newRule pe@(P x) = f x where
@@ -718,26 +748,27 @@ newRule pe@(P x) = f x where
         put $! (x + 1)
         return (P $ Named x pe)
 
-
 data Regex =
     RegexChars Bool IntSet.IntSet
     | RegexAny
-    | RegexMany {
-        regexWhat :: Regex,
-        regexMin  :: Int,
-        regexMax  :: Maybe Int,
-        regexMunch:: Bool
-        }
+    | RegexManyC Regex Int (Maybe Int) Bool  -- Changed to regular constructor
     | RegexCat [Regex]
     deriving(Show,Eq,Ord)
+
+-- Pattern synonym providing the record-style interface
+pattern RegexMany :: Regex -> Int -> Maybe Int -> Bool -> Regex
+pattern RegexMany{regexWhat, regexMin, regexMax, regexMunch} =
+    RegexManyC regexWhat regexMin regexMax regexMunch
+{-# COMPLETE RegexChars, RegexAny, RegexMany, RegexCat #-}
+
 
 normalizeRegex :: Regex -> Regex
 normalizeRegex r = f r where
     f RegexAny = RegexAny
     f (RegexCat xs) = regexCat $ g (map f xs)
-    f rm@RegexMany { regexWhat = r }
+    f rm@RegexMany { regexWhat = r, .. }
         | RegexCat [] <- r' = RegexCat []
-        | otherwise = regexCat (replicate (regexMin rm) r' ++ [rm { regexWhat = r', regexMin = 0, regexMax = fmap (subtract $ regexMin rm) (regexMax rm) }])
+        | otherwise = regexCat (replicate regexMin r' ++ [rm { regexWhat = r', regexMin = 0, regexMax = fmap (subtract regexMin) regexMax }])
        where r' = f r
     f r@RegexChars {} = r
     g (RegexCat x:xs) = x ++ g xs
@@ -747,20 +778,18 @@ normalizeRegex r = f r where
     regexCat [x] = x
     regexCat xs = RegexCat xs
 
-regexToParser :: Regex -> P s String
-regexToParser r = f r where
-    f RegexAny = anyChar ## (:[])
-    f (RegexChars True m)  = oneOf  (map chr $ IntSet.toList m) ## (:[])
-    f (RegexChars False m) = noneOf (map chr $ IntSet.toList m) ## (:[])
-    f (RegexCat []) = unit ""
-    f (RegexCat (x:xs)) = f x <++> f (RegexCat xs)
-    f RegexMany { regexWhat = r, regexMin = 0, regexMax = Nothing } = many (f r) ## concat
-    f rm@RegexMany { regexWhat = r, regexMin = n, regexMax = Nothing } = f r <++> f rm { regexMin = n - 1 }
-    f RegexMany { regexWhat = r, regexMin = 0, regexMax = Just 1 } = f r // unit ""
+regexToParser :: (IsSequence mono, Enum (Element mono)) => Regex -> P s mono mono
+regexToParser = \case
+    RegexAny -> anyChar ## opoint
+    (RegexChars True m)  -> elemOf     (toEnum <$> IntSet.toList m) ## opoint
+    (RegexChars False m) -> noneElemOf (toEnum <$> IntSet.toList m) ## opoint
+    (RegexCat []) -> unit mempty
+    (RegexCat (x:xs)) -> regexToParser x <++> regexToParser (RegexCat xs)
+    RegexMany { regexWhat = r, regexMin = 0, regexMax = Nothing } -> many (regexToParser r) ## oconcat
+    rm@RegexMany { regexWhat = r, regexMin = n, regexMax = Nothing } -> regexToParser r <++> regexToParser rm { regexMin = n - 1 }
+    RegexMany { regexWhat = r, regexMin = 0, regexMax = Just 1 } -> regexToParser r // unit mempty
 
-
-
-parseRegex :: forall s . PM s (P s (Maybe Regex))
+parseRegex :: forall s mono. (IsSequence mono, IsChar (Element mono), Enum (Element mono)) => PM s (P s mono (Maybe Regex))
 parseRegex =
     do rec regex <- newRule $ primary <<- char '*' <> isMatch (char '?')   ## (\ (r,m) -> RegexMany { regexWhat = r, regexMin = 0, regexMax = Nothing, regexMunch = m })
              // primary <<- char '+' <> isMatch (char '?')         ## (\ (r,m) -> RegexMany { regexWhat = r, regexMin = 1, regexMax = Nothing, regexMunch = m })
@@ -768,41 +797,36 @@ parseRegex =
              // primary
            primary <- newRule $ char '(' ->> fregex <<- char ')'
                    // char '.' ##> RegexAny
-                   // text "[^" ->> char_class <<- char ']' ## RegexChars False . IntSet.fromList . map ord
-                   // char '['  ->> char_class <<- char ']' ## RegexChars True  . IntSet.fromList . map ord
-                   // rchar ## RegexChars True . IntSet.singleton . ord
-           rchar <-   newRule $ text "\\n" ##> '\n'
-                   // text "\\t" ##> '\t'
-                   // text "\\f" ##> '\f'
-                   // text "\\a" ##> '\a'
-                   // text "\\e" ##> '\033'
-                   // text "\\r" ##> '\r'
-                   // text "\\0" ##> '\0'
+                   // text "[^" ->> char_class <<- char ']' ## RegexChars False . IntSet.fromList . map fromEnum . otoList
+                   // char '['  ->> char_class <<- char ']' ## RegexChars True  . IntSet.fromList . map fromEnum . otoList
+                   // rchar ## RegexChars True . IntSet.singleton . fromEnum
+           rchar <-   newRule $ text "\\n" ##> (fromChar '\n' :: Element mono)
+                   // text "\\t" ##> fromChar '\t'
+                   // text "\\f" ##> fromChar '\f'
+                   // text "\\a" ##> fromChar '\a'
+                   // text "\\e" ##> fromChar '\033'
+                   // text "\\r" ##> fromChar '\r'
+                   // text "\\0" ##> fromChar '\0'
                    // char '\\' ->> anyChar
                    // noneOf ".[*+()\\"
            char_class1 <- newRule $
                    anyChar <<- char '-' <> anyChar ## uncurry enumFromTo
-                   // anyChar ## (:[])
+                   // anyChar ## opoint
            char_class <- fmap (fmap concat) $ manyUntil (char ']') char_class1
            fregex <- newRule $  many regex ## RegexCat
        return $ fmap (Just . normalizeRegex) (fregex <<- eof) // unit Nothing
 
 
 -- | always succeeds, returning true if it consumed something.
-isMatch :: P s a -> P s Bool
+isMatch :: P s mono a -> P s mono Bool
 isMatch p = p ->> unit True // unit False
-
-parse_regex :: String -> Maybe Regex
-parse_regex = runPeg parseRegex
-
-
 
 
 -- | Create a new regular expression matching parser. it returns something in a
 -- possibly failing monad to indicate an error in the regular expression itself.
 
-newRegex :: Fail.MonadFail m => String -> m (PM s (P s String))
-newRegex s = case parse_regex s of
+newRegex :: (IsSequence mono, Show mono, Fail.MonadFail m, IsChar (Element mono), Enum (Element mono), Eq (Element mono)) => mono -> m (PM s (P s mono mono))
+newRegex s = case runPeg parseRegex s of
     Just r -> return (return $ regexToParser r)
     Nothing -> err
    where err = Fail.fail $ "invalid regular expression: " ++ show s
@@ -812,12 +836,13 @@ newRegex s = case parse_regex s of
 showRegex :: String -> IO ()
 showRegex s = do
     putStrLn $ "Parsing: " ++ show s
-    print (parse_regex s)
+    print (runPeg parseRegex s)
 
 -- | Make a new regex but abort on an error in the regex string itself.
-regex :: String -> PM s (P s String)
+regex :: (IsSequence mono, Show mono, IsChar (Element mono), Enum (Element mono), Eq (Element mono)) => mono -> PM s (P s mono mono)
 regex s =
-  case parse_regex s of
+  case runPeg parseRegex s of
     Just r -> return $ regexToParser r
     Nothing -> err
    where err = error $ "invalid regular expression: " ++ show s
+
